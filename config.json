@@ -1,0 +1,25 @@
+{
+    "monitor": {
+      "top": 100,
+      "left": 200,
+      "width": 1280,
+      "height": 720
+    },
+    "rtsp_url": "rtsp://AdrianHd1110:Kamerka123@172.16.234.13:554/stream1",
+    "model_path": "best2504.pt",
+    "thresholds": {
+      "min_thresh": 0.6,
+      "skip_rate": 6,
+      "min_box_frac": 0.10
+    },
+    "confirm_delay": 5.0,
+    "alarm_duration": 15.0,
+    "bbox_colors": [
+      [164, 120, 87],
+      [68, 148, 228],
+      [93, 97, 209],
+      [178, 182, 133],
+      [88, 159, 106]
+    ]
+  }
+  
