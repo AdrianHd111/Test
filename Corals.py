@@ -28,10 +28,8 @@ import cv2
 import numpy as np
 from gpiozero import OutputDevice          # sterowanie lampką
 
-from pycoral.engine import Interpreter
-
-interpreter = Interpreter("model.tflite")
-interpreter.allocate_tensors()
+from pycoral.utils.edgetpu import make_interpreter
+from pycoral.adapters import common, detect
 
 # ------------------------------------------------------------
 # Konfiguracja modelu i źródła wideo

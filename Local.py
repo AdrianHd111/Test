@@ -20,6 +20,7 @@ from collections import defaultdict
 from PyQt5.QtWidgets import QMainWindow, QApplication, QLabel, QWidget, QVBoxLayout
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QImage, QPixmap
+from gpiozero import OutputDevice
 
 # --- wczytanie konfiguracji ---
 with open('config.json', 'r') as f:
@@ -31,6 +32,16 @@ TH             = cfg['thresholds']
 CONFIRM_DELAY  = cfg['confirm_delay']
 ALARM_DURATION = cfg['alarm_duration']
 BBOX_COLORS    = [tuple(c) for c in cfg['bbox_colors']]
+
+lamp = OutputDevice(17, active_high=True, initial_value=False)
+
+def lamp_on():
+    lamp.on()
+    print("\U0001F4A1  LAMPKA ON")
+
+def lamp_off():
+    lamp.off()
+    print("\U0001F4A1  LAMPKA OFF")
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -120,6 +131,8 @@ class MainWindow(QMainWindow):
                     self.spider_alert[zone]       = False
                     self.rope_missing_since[zone] = None
                     print(f"[{zone.upper()}] ALARM STOP po {ALARM_DURATION}s")
+                    if not any(self.spider_alert.values()):
+                        lamp_off()
 
             img   = sct.grab(MONITOR)
             frame = cv2.resize(np.array(img)[:, :, :3], (self.cam_w, self.cam_h))
@@ -225,6 +238,8 @@ class MainWindow(QMainWindow):
                         self.rope_missing_since[zone] = None
                         self.spider_alert[zone]       = False
                         self.alarm_start_time[zone]   = None
+                        if not any(self.spider_alert.values()):
+                            lamp_off()
 
                     elif saw_no[zone]:
                         # brak liny: start pomiaru lub alarm
@@ -238,6 +253,7 @@ class MainWindow(QMainWindow):
                             self.daily_count           += 1
                             ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             print(f"[{ts}] ALARM START w strefie: {zone.upper()}")
+                            lamp_on()
 
             self.frame_queue.put(frame)
 
@@ -300,6 +316,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         self.stop_event.set()
+        lamp_off()
         e.accept()
 
 

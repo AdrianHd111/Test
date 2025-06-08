@@ -13,6 +13,7 @@ from climbcheck import process_frame
 from PyQt5.QtWidgets import QMainWindow, QApplication, QLabel, QWidget, QVBoxLayout
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QImage, QPixmap
+from gpiozero import OutputDevice
 
 # --- wczytanie konfiguracji ---
 with open('config.json', 'r') as f:
@@ -24,6 +25,16 @@ TH = cfg['thresholds']
 CONFIRM_DELAY = cfg['confirm_delay']
 ALARM_DURATION = cfg['alarm_duration']
 BBOX_COLORS = [tuple(c) for c in cfg['bbox_colors']]
+
+lamp = OutputDevice(17, active_high=True, initial_value=False)
+
+def lamp_on():
+    lamp.on()
+    print("\U0001F4A1  LAMPKA ON")
+
+def lamp_off():
+    lamp.off()
+    print("\U0001F4A1  LAMPKA OFF")
 
 
 class MainWindow(QMainWindow):
@@ -94,6 +105,7 @@ class MainWindow(QMainWindow):
             if self.spider_alert and (now - self.alarm_start_time) >= ALARM_DURATION:
                 self.spider_alert = False
                 self.rope_missing_since = None
+                lamp_off()
 
             if frame_id % self.skip_rate == 0:
                 frame, last_det = process_frame(
@@ -113,7 +125,9 @@ class MainWindow(QMainWindow):
 
                 if saw_with:
                     self.rope_missing_since = None
-                    self.spider_alert = False
+                    if self.spider_alert:
+                        self.spider_alert = False
+                        lamp_off()
 
                 elif saw_no:
                     if self.rope_missing_since is None:
@@ -124,6 +138,7 @@ class MainWindow(QMainWindow):
                         self.daily_count += 1
                         ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         print(f"[{ts}] ALARM START (RTSP)")
+                        lamp_on()
 
             self.frame_queue.put(frame)
 
@@ -172,6 +187,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, e):
         self.stop_event.set()
         self.cap.release()
+        lamp_off()
         e.accept()
 
 

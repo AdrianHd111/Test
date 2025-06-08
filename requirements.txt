@@ -1,0 +1,8 @@
+ultralytics
+deep_sort_realtime
+mss
+PyQt5
+opencv-python
+gpiozero
+tflite-runtime
+pycoral
