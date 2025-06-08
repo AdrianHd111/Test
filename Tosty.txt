@@ -1,0 +1,296 @@
+"""
+coral.py  –  alarm na "Spidermana" (brak liny) z Google Coral USB Accelerator
+───────────────────────────────────────────────────────────────────────────────
+Wersja szyta pod Raspberry Pi OS Bookworm / Python 3.11.
+
+● Jeżeli masz bibliotekę **pycoral** (np. w środowisku z Pythonem ≤ 3.10) – 
+  skrypt z niej skorzysta.
+● Gdy pycoral nie jest dostępny (typowy przypadek na Bookworm + cp311),
+  przełącza się automatycznie na **tflite‑runtime** z delegatem Edge TPU.
+
+Instalacja zależności w venv‑ie (Bookworm, Python 3.11):
+    pip install --upgrade pip
+    pip install --extra-index-url https://www.piwheels.org/simple \
+        "numpy<2" tflite-runtime opencv-python-headless gpiozero
+
+Jeśli chcesz obsługiwać okno `cv2.imshow`, zamień `opencv-python-headless`
+na `opencv-python` (wymaga dodatkowych bibliotek GUI).
+
+Autor: ChatGPT (2025)
+"""
+
+from __future__ import annotations
+
+import datetime
+import sys
+import time
+from pathlib import Path
+from typing import List, Tuple
+
+import cv2  # OpenCV
+import numpy as np
+from gpiozero import OutputDevice  # sterowanie przekaźnikiem / lampką
+
+# ----------------------------------------------------------------------------
+# Próba użycia pycoral.  Jeśli nie ma – spadamy na tflite‑runtime + delegat.
+# ----------------------------------------------------------------------------
+try:
+    from pycoral.utils.edgetpu import make_interpreter  # type: ignore
+    from pycoral.adapters import common, detect  # type: ignore
+
+    USE_PYCORAL = True
+except ModuleNotFoundError:
+    from tflite_runtime.interpreter import Interpreter, load_delegate  # type: ignore
+
+    USE_PYCORAL = False
+
+# ----------------------------------------------------------------------------
+# Konfiguracja modelu, wideo i progów alarmu
+# ----------------------------------------------------------------------------
+MODEL_PATH = "best2504_int8_edgetpu.tflite"  # 2 klasy: 0 = rope, 1 = norop
+VIDEO_PATH = "test.mp4"  # 0 → kamera / dev/video0
+
+MIN_THRESH = 0.5  # minimalna pewność detekcji
+MIN_BOX_FRAC = 0.10  # bbox „norop” musi się kończyć ≥ 10 % nad dołem klatki
+CONFIRM_DELAY = 5.0  # s do potwierdzenia braku liny
+ALARM_DUR = 10.0  # s trwania alarmu
+SKIP_RATE = 5  # detekcja co N klatek (oszczędza CPU)
+
+LABELS = {0: "rope", 1: "norop"}
+
+# ----------------------------------------------------------------------------
+# GPIO – lampka 12 V na przekaźniku (BCM 17)
+# ----------------------------------------------------------------------------
+lamp = OutputDevice(17, active_high=True, initial_value=False)
+
+
+def lamp_on() -> None:
+    lamp.on()
+    print("💡  LAMPKA ON")
+
+
+def lamp_off() -> None:
+    lamp.off()
+    print("💡  LAMPKA OFF")
+
+# ----------------------------------------------------------------------------
+# Inicjalizacja interpretera TFLite (+ delegat Edge TPU) albo PyCoral
+# ----------------------------------------------------------------------------
+if not Path(MODEL_PATH).exists():
+    sys.exit(f"❌  Nie znaleziono modelu: {MODEL_PATH}")
+
+print("⏳  Ładowanie modelu…")
+if USE_PYCORAL:
+    interpreter = make_interpreter(f"delegate:auto:{MODEL_PATH}")
+    interpreter.allocate_tensors()
+    input_height, input_width = common.input_size(interpreter)
+else:
+    interpreter = Interpreter(
+        model_path=MODEL_PATH,
+        experimental_delegates=[load_delegate("libedgetpu.so.1")],
+    )
+    interpreter.allocate_tensors()
+    in_det = interpreter.get_input_details()[0]
+    input_height, input_width = in_det["shape"][1:3]
+
+print(
+    f"✅  Model załadowany ({input_width}×{input_height})  ▶ tryb: "
+    + ("PyCoral" if USE_PYCORAL else "tflite‑runtime")
+)
+
+# ----------------------------------------------------------------------------
+# Funkcja pomocnicza – odczyt detekcji dla wariantu bez PyCoral
+# ----------------------------------------------------------------------------
+Output = Tuple[int, int, int, int, float, int]  # x0, y0, x1, y1, score, class_id
+
+def get_objects_tflite(
+    tflite_interpreter: "Interpreter",  # w cudzysłowie: import opcjonalny
+    score_threshold: float,
+    img_h: int,
+    img_w: int,
+) -> List[Output]:
+    """Zwraca listę detekcji (bbox + klasa) z modeli SSD TFLite.
+
+    Zakładamy standardowy format Edge‑TPU Detection Post‑Process:
+    • 4 wyjścia: boxes (1×N×4), classes (1×N), scores (1×N), num_detections (1)
+    • współrzędne (ymin, xmin, ymax, xmax) znormalizowane do [0, 1].
+    """
+    outs = tflite_interpreter.get_output_details()
+    if len(outs) < 4:
+        return []  # Nieznany format wyjścia – brak detekcji.
+
+    boxes = tflite_interpreter.get_tensor(outs[0]["index"])[0]  # type: ignore
+    class_ids = tflite_interpreter.get_tensor(outs[1]["index"])[0]  # type: ignore
+    scores = tflite_interpreter.get_tensor(outs[2]["index"])[0]  # type: ignore
+    num = int(tflite_interpreter.get_tensor(outs[3]["index"])[0])  # type: ignore
+
+    results: List[Output] = []
+    for i in range(num):
+        if scores[i] < score_threshold:
+            continue
+        ymin, xmin, ymax, xmax = boxes[i]
+        x0, y0 = int(xmin * img_w), int(ymin * img_h)
+        x1, y1 = int(xmax * img_w), int(ymax * img_h)
+        results.append((x0, y0, x1, y1, float(scores[i]), int(class_ids[i])))
+    return results
+
+# ----------------------------------------------------------------------------
+# Inicjalizacja wideo
+# ----------------------------------------------------------------------------
+cap = cv2.VideoCapture(VIDEO_PATH)
+if not cap.isOpened():
+    sys.exit(f"🚨  Nie można otworzyć źródła wideo: {VIDEO_PATH}")
+
+cam_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+cam_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+print("🔎  Start – naciśnij 'q' lub Ctrl‑C, aby zakończyć")
+
+# ----------------------------------------------------------------------------
+# Zmienne stanu
+# ----------------------------------------------------------------------------
+rope_since: float | None = None
+alarm_start: float | None = None
+in_alert = False
+
+fps, fps_count, fps_timer = 0.0, 0, time.time()
+frame_id = 0
+
+daily_date = datetime.date.today()
+daily_alarms = 0
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # pętla, gdy plik się skończy
+            continue
+
+        frame_id += 1
+        now = time.time()
+
+        # FPS – aktualizuj co 1 sekundę
+        fps_count += 1
+        if now - fps_timer >= 1.0:
+            fps = fps_count / (now - fps_timer)
+            fps_count, fps_timer = 0, now
+
+        # reset dzienny liczby alarmów
+        if datetime.date.today() != daily_date:
+            daily_date, daily_alarms = datetime.date.today(), 0
+
+        # wygaś alarm po ALARM_DUR
+        if in_alert and alarm_start and (now - alarm_start >= ALARM_DUR):
+            print(f"[{datetime.datetime.now()}] ⏹  Alarm OFF")
+            in_alert, rope_since = False, None
+            lamp_off()
+
+        # detekcja tylko na co SKIP_RATE klatek
+        if frame_id % SKIP_RATE == 0:
+            # przygotuj wejście (BGR→RGB, resize, NHWC, uint8)
+            img_resized = cv2.resize(frame, (input_width, input_height))
+            rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+            rgb = np.expand_dims(rgb, 0).astype(np.uint8)
+
+            if USE_PYCORAL:
+                common.set_input(interpreter, rgb)
+                interpreter.invoke()
+                objs = detect.get_objects(
+                    interpreter,
+                    MIN_THRESH,
+                    image_scale=(frame.shape[0] / input_height, frame.shape[1] / input_width),
+                )
+                detections: List[Output] = [
+                    (
+                        o.bbox.xmin,
+                        o.bbox.ymin,
+                        o.bbox.xmax,
+                        o.bbox.ymax,
+                        o.score,
+                        o.id,
+                    )
+                    for o in objs
+                ]
+            else:
+                # tflite‑runtime
+                in_detail = interpreter.get_input_details()[0]
+                interpreter.set_tensor(in_detail["index"], rgb)
+                interpreter.invoke()
+                detections = get_objects_tflite(
+                    interpreter, MIN_THRESH, cam_h, cam_w
+                )
+
+            # status liny
+            has_rope = any(d[5] == 0 for d in detections)
+            no_rope = any(
+                d[5] == 1 and d[3] <= (1 - MIN_BOX_FRAC) * cam_h for d in detections
+            )
+
+            # logika alarmu
+            if has_rope:
+                rope_since = None
+                if in_alert:
+                    in_alert = False
+                    lamp_off()
+            elif no_rope:
+                if rope_since is None:
+                    rope_since = now
+                    print(
+                        f"[{datetime.datetime.now()}] ⚠️  Potencjalny brak liny – odliczam…"
+                    )
+                elif (not in_alert) and (now - rope_since >= CONFIRM_DELAY):
+                    in_alert, alarm_start = True, now
+                    daily_alarms += 1
+                    print(
+                        f"[{datetime.datetime.now()}] 🚨  ALARM! (#{daily_alarms})"
+                    )
+                    lamp_on()
+
+            # rysowanie bboxów
+            for x0, y0, x1, y1, score, cid in detections:
+                color = (0, 255, 0) if cid == 0 else (0, 0, 255)
+                cv2.rectangle(frame, (x0, y0), (x1, y1), color, 2)
+                cv2.putText(
+                    frame,
+                    f"{LABELS.get(cid, 'id'+str(cid))}:{score:.2f}",
+                    (x0, max(15, y0 - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2,
+                )
+
+        # overlay alarmu + statystyki
+        if in_alert:
+            cv2.putText(
+                frame,
+                "!! UWAGA SPIDERMAN !!",
+                (10, 40),
+                cv2.FONT_HERSHEY_DUPLEX,
+                1.0,
+                (0, 0, 255),
+                3,
+            )
+
+        legend = f"FPS: {fps:.1f}   Alarmy dziś: {daily_alarms}"
+        cv2.putText(
+            frame,
+            legend,
+            (10, cam_h - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 255, 0),
+            2,
+        )
+
+        cv2.imshow("Spiderman Alarm – Edge TPU", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+except KeyboardInterrupt:
+    print("\n⏹  Przerwano przez użytkownika")
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    lamp_off()
+    print("✅  Zakończono – zasoby zwolnione")
